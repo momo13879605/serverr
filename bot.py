@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime
-import os
+
 import aiosqlite
 import asyncssh
 from cryptography.fernet import Fernet
@@ -103,7 +104,7 @@ async def init_db():
                 value TEXT NOT NULL
             )
         """)
-        # ثبت ادمین‌های اولیه از ثابت‌ها
+        # ثبت ادمین‌های اولیه
         for uid in ADMIN_IDS:
             await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
         # تنظیمات پیش‌فرض
@@ -245,10 +246,9 @@ async def add_command_history(server_id, user_id, command, output):
 
 # -------------------- مدیریت اتصال SSH --------------------
 connections_cache: dict[int, asyncssh.SSHClientConnection] = {}
-ssh_semaphore: asyncio.Semaphore = None  # در main مقداردهی می‌شود
+ssh_semaphore: asyncio.Semaphore = None
 
 async def get_ssh_connection(server_id: int) -> asyncssh.SSHClientConnection:
-    """برمی‌گرداند یک کانکشن فعال برای سرور داده شده. در صورت نیاز مجدداً متصل می‌شود."""
     global ssh_semaphore
     conn = connections_cache.get(server_id)
     if conn is not None and conn.is_closed():
@@ -301,7 +301,6 @@ async def logout_server(server_id: int):
 
 # -------------------- تقسیم پیام بلند --------------------
 async def send_long_message(update: Update, text: str):
-    """ارسال پیام با رعایت محدودیت طول تلگرام"""
     for i in range(0, len(text), MAX_MESSAGE_LENGTH):
         chunk = text[i:i+MAX_MESSAGE_LENGTH]
         if update.message:
@@ -384,7 +383,6 @@ async def add_server_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         old_active = context.user_data.get("active_server_id")
         if old_active:
             await logout_server(old_active)
-        global ssh_semaphore
         async with ssh_semaphore:
             live_conn = await asyncssh.connect(ip, username=username, password=password, known_hosts=None)
         connections_cache[server_id] = live_conn
@@ -444,7 +442,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     user_data = context.user_data
 
-    # دکمه‌های منو
     if text == "➕ افزودن سرور جدید":
         return await add_server_start(update, context)
     if text == "🔄 جابجایی بین سرورها":
@@ -470,12 +467,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🛡 پنل مدیریت" and await is_admin(user_id):
         return await admin_panel(update, context)
 
-    # اجرای دستور Bash روی سرور فعال
     active_id = user_data.get("active_server_id")
     if not active_id:
         await update.message.reply_text("⚠️ شما وارد هیچ سروری نشده‌اید.")
         return
-    # بررسی دستورات مخرب (ساده)
     dangerous_patterns = [r"rm\s+-rf\s+/", r">\s*/dev/sda", r"mkfs", r"dd\s+if="]
     for pat in dangerous_patterns:
         if re.search(pat, text, re.IGNORECASE):
@@ -704,17 +699,18 @@ async def set_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ssh_semaphore = asyncio.Semaphore(int(value))
     await update.message.reply_text(f"✅ تنظیم {key} به {value} تغییر یافت.")
 
-# ---------- اصلی ----------
+# ---------- post_init ----------
 async def post_init(app: Application):
     global ssh_semaphore
+    await init_db()                     # راه‌اندازی دیتابیس
     settings = await get_settings()
     max_ssh = int(settings.get("max_concurrent_ssh", MAX_CONCURRENT_SSH))
     ssh_semaphore = asyncio.Semaphore(max_ssh)
 
+# ---------- اصلی ----------
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # ConversationHandler برای افزودن سرور
     add_server_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ افزودن سرور جدید$"), add_server_start)],
         states={
@@ -725,7 +721,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ConversationHandler برای تغییر نام
     rename_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✏️ تغییر نام سرور$"), rename_start)],
         states={
@@ -741,16 +736,12 @@ def main():
     app.add_handler(CommandHandler("setsetting", set_setting))
     app.add_handler(add_server_conv)
     app.add_handler(rename_conv)
-    # هندلر پیام‌های متنی معمولی (منوها و اجرای دستور)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_callback))
-    # هندلر مخصوص دریافت ورودی‌های ادمین (باید بعد از هندلرهای اصلی باشد)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_input), group=1)
 
     logger.info("ربات شروع شد...")
     app.run_polling()
 
 if __name__ == "__main__":
-    import os  # فقط برای load_or_create_key نیاز است
-    asyncio.run(init_db())
     main()
