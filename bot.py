@@ -256,7 +256,10 @@ async def get_ssh_connection(server_id: int) -> asyncssh.SSHClientConnection:
     return conn
 
 async def execute_remote_command(conn, command: str, timeout: int = COMMAND_TIMEOUT) -> str:
-    """اجرای یک دستور و برگرداندن خروجی کامل (stdout+stderr)"""
+    """
+    دستور را روی سرور اجرا می‌کند و خروجی کامل را برمی‌گرداند.
+    نسبت به نوع دادهٔ خروجی (بایت یا رشته) هوشمند عمل می‌کند.
+    """
     proc = await conn.create_process(command)
     out_parts = []
 
@@ -265,7 +268,11 @@ async def execute_remote_command(conn, command: str, timeout: int = COMMAND_TIME
             data = await stream.read(8192)
             if not data:
                 break
-            out_parts.append(data.decode(errors='replace'))
+            # ممکن است بعضی نسخه‌های asyncssh رشته برگردانند
+            if isinstance(data, bytes):
+                out_parts.append(data.decode(errors='replace'))
+            else:
+                out_parts.append(data)
 
     try:
         await asyncio.wait_for(
@@ -402,7 +409,10 @@ async def add_server_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         # دریافت مسیر خانه
         proc = await conn.create_process("pwd")
-        home_raw = (await proc.stdout.read()).decode().strip()
+        home_raw = await proc.stdout.read()
+        if isinstance(home_raw, bytes):
+            home_raw = home_raw.decode()
+        home_raw = home_raw.strip()
         proc.close()
         conn.close()
 
@@ -416,7 +426,7 @@ async def add_server_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         connections_cache[server_id] = live_conn
         await set_server_status(server_id, True)
         context.user_data["active_server_id"] = server_id
-        context.user_data["current_dir"] = home_raw.strip()
+        context.user_data["current_dir"] = home_raw
         context.user_data.pop("state", None)
         await update.message.reply_text(
             "✅ ورود موفق!\nاکنون می‌توانید دستورات خود را ارسال کنید.",
@@ -777,7 +787,6 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"✅ پیام به {success} از {len(users)} کاربر ارسال شد.")
         context.user_data.pop("admin_action", None)
 
-# کمبود توابع add_admin_to_db و remove_admin_from_db
 async def add_admin_to_db(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
@@ -842,7 +851,6 @@ def main():
     app.add_handler(rename_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_callback))
-    # هندلر مخصوص ورودی‌های ادمین (group=1 یعنی بعد از هندلر اصلی)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_input), group=1)
 
     logger.info("ربات شروع شد...")
