@@ -23,17 +23,16 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ======================== تنظیمات مستقیم ========================
-TOKEN = "7635713211:AAH7A4PInJmeYgoLXSeFTPl9EaTquCyS24M"                     # توکن ربات تلگرام
-ADMIN_IDS = [5914346958]           # لیست آیدی‌های عددی ادمین‌ها
+# ======================== تنظیمات (مستقیم) ========================
+TOKEN = "7635713211:AAH7A4PInJmeYgoLXSeFTPl9EaTquCyS24M"                # ← جایگزین کنید
+ADMIN_IDS = [5914346958]                # ← آیدی ادمین‌ها
 MAX_MESSAGE_LENGTH = 4096
-MAX_CONCURRENT_SSH = 5                       # حداکثر تعداد اتصال همزمان SSH
-COMMAND_TIMEOUT = 30                         # تایم‌اوت اجرای دستور (ثانیه)
+MAX_CONCURRENT_SSH = 5
+COMMAND_TIMEOUT = 60                    # افزایش برای دستورات طولانی
 DB_PATH = "servers.db"
 KEY_FILE = "secret.key"
 # ================================================================
 
-# -------------------- لاگ‌گیری --------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -58,7 +57,7 @@ def encrypt(text: str) -> str:
 def decrypt(text: str) -> str:
     return cipher.decrypt(text.encode()).decode()
 
-# -------------------- دیتابیس (ناهمگام) --------------------
+# -------------------- دیتابیس --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -104,10 +103,8 @@ async def init_db():
                 value TEXT NOT NULL
             )
         """)
-        # ثبت ادمین‌های اولیه
         for uid in ADMIN_IDS:
             await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
-        # تنظیمات پیش‌فرض
         await db.execute(
             "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('max_concurrent_ssh', ?)",
             (str(MAX_CONCURRENT_SSH),)
@@ -118,7 +115,7 @@ async def init_db():
         )
         await db.commit()
 
-# -------------------- توابع کمکی دیتابیس --------------------
+# -------------------- عملیات پایگاه داده (همانند قبل) --------------------
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)) as cur:
@@ -272,25 +269,59 @@ async def get_ssh_connection(server_id: int) -> asyncssh.SSHClientConnection:
         await set_server_status(server_id, True)
     return conn
 
-async def execute_command(server_id: int, user_id: int, command: str) -> str:
+async def execute_command_streaming(server_id: int, user_id: int, command: str,
+                                    update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """
+    دستور را با create_process اجرا می‌کند، خروجی را جمع‌آوری کرده و
+    در صورت طولانی بودن به‌صورت خودکار خرد می‌کند و می‌فرستد.
+    """
     try:
         conn = await get_ssh_connection(server_id)
         settings = await get_settings()
         timeout = int(settings.get("command_timeout", COMMAND_TIMEOUT))
-        result = await asyncio.wait_for(conn.run(command, check=False), timeout=timeout)
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        output = stdout
-        if stderr:
-            output += ("\n" + stderr) if output else stderr
-        await add_command_history(server_id, user_id, command, output)
-        return output.strip() or "(خروجی خالی)"
-    except asyncio.TimeoutError:
-        return "⏰ اجرای دستور بیش از حد طول کشید (timeout)"
-    except asyncssh.Error as e:
-        return f"❌ خطای SSH: {e}"
     except Exception as e:
-        return f"❌ خطای غیرمنتظره: {e}"
+        return f"❌ خطا در اتصال: {e}"
+
+    proc = None
+    try:
+        proc = await conn.create_process(command)
+    except Exception as e:
+        return f"❌ خطا در ایجاد فرآیند: {e}"
+
+    output_parts = []
+    async def read_stream(stream):
+        while not stream.at_eof():
+            try:
+                data = await asyncio.wait_for(stream.read(8192), timeout=5)
+                if data:
+                    output_parts.append(data.decode(errors='replace'))
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+    try:
+        await asyncio.wait_for(asyncio.gather(
+            read_stream(proc.stdout),
+            read_stream(proc.stderr)
+        ), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.terminate()
+        await update.message.reply_text("⏰ اجرای دستور بیش از حد طول کشید و متوقف شد.")
+    finally:
+        proc.close()
+        await proc.wait_closed()
+
+    full_output = ''.join(output_parts).strip()
+    if not full_output:
+        full_output = "(خروجی خالی)"
+
+    # ثبت تاریخچه
+    await add_command_history(server_id, user_id, command, full_output)
+
+    # ارسال خروجی با رعایت محدودیت طول
+    await send_long_message(update, full_output)
+    return full_output  # برای استفاده‌های احتمالی دیگر
 
 async def logout_server(server_id: int):
     conn = connections_cache.pop(server_id, None)
@@ -299,7 +330,7 @@ async def logout_server(server_id: int):
         await conn.wait_closed()
     await set_server_status(server_id, False)
 
-# -------------------- تقسیم پیام بلند --------------------
+# -------------------- ارسال پیام بلند --------------------
 async def send_long_message(update: Update, text: str):
     for i in range(0, len(text), MAX_MESSAGE_LENGTH):
         chunk = text[i:i+MAX_MESSAGE_LENGTH]
@@ -312,7 +343,7 @@ async def send_long_message(update: Update, text: str):
 WAITING_FOR_IP, WAITING_FOR_USERNAME, WAITING_FOR_PASSWORD = range(3)
 WAITING_FOR_NEW_NAME = 4
 
-# -------------------- کیبوردهای اصلی --------------------
+# -------------------- کیبورد اصلی --------------------
 def main_keyboard(is_admin: bool, is_active: bool):
     keyboard = []
     if is_active:
@@ -324,7 +355,7 @@ def main_keyboard(is_admin: bool, is_active: bool):
         keyboard.append(["🛡 پنل مدیریت"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# -------------------- هندلرها --------------------
+# -------------------- هندلر start --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await register_user(user.id, user.first_name, user.username)
@@ -333,17 +364,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_server = next((s for s in servers if s["is_logged_in"]), None)
     if active_server:
         context.user_data["active_server_id"] = active_server["id"]
+        context.user_data["current_dir"] = "~"
     else:
         context.user_data.pop("active_server_id", None)
-
+        context.user_data.pop("current_dir", None)
     admin = await is_admin(user.id)
     await update.message.reply_text(
-        f"👋 خوش آمدید {user.first_name}!\n"
-        "برای شروع یک سرور اضافه کنید یا از منو استفاده کنید.",
+        f"👋 خوش آمدید {user.first_name}!\nبرای شروع یک سرور اضافه کنید یا از منو استفاده کنید.",
         reply_markup=main_keyboard(admin, active_server is not None)
     )
 
-# ---------- مکالمۀ افزودن سرور ----------
+# ---------- ConversationHandler (افزودن سرور) ----------
 async def add_server_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = "adding_server"
     await update.message.reply_text("📡 لطفاً آی‌پی سرور را وارد کنید:")
@@ -388,6 +419,7 @@ async def add_server_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         connections_cache[server_id] = live_conn
         await set_server_status(server_id, True)
         context.user_data["active_server_id"] = server_id
+        context.user_data["current_dir"] = "~"
         context.user_data.pop("state", None)
         await update.message.reply_text(
             "✅ ورود موفق!\nاکنون می‌توانید دستورات خود را ارسال کنید.",
@@ -405,7 +437,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-# ---------- مکالمۀ تغییر نام ----------
+# ---------- ConversationHandler (تغییر نام) ----------
 async def rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     servers = await get_user_servers(update.effective_user.id)
     if not servers:
@@ -435,13 +467,14 @@ async def rename_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.pop("rename_server_id", None)
     return ConversationHandler.END
 
-# ---------- هندلر پیام‌های متنی (اجرای دستور، منوها) ----------
+# ---------- هندلر متن (اجرای دستورات و منوها) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     user_id = user.id
     user_data = context.user_data
 
+    # اولویت به دستورات منو
     if text == "➕ افزودن سرور جدید":
         return await add_server_start(update, context)
     if text == "🔄 جابجایی بین سرورها":
@@ -467,18 +500,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🛡 پنل مدیریت" and await is_admin(user_id):
         return await admin_panel(update, context)
 
+    # بررسی وجود سرور فعال
     active_id = user_data.get("active_server_id")
     if not active_id:
         await update.message.reply_text("⚠️ شما وارد هیچ سروری نشده‌اید.")
         return
-    dangerous_patterns = [r"rm\s+-rf\s+/", r">\s*/dev/sda", r"mkfs", r"dd\s+if="]
-    for pat in dangerous_patterns:
-        if re.search(pat, text, re.IGNORECASE):
-            await update.message.reply_text("⛔️ دستور مخرب تشخیص داده شد، اجرا نمی‌شود!")
-            return
+
+    # مدیریت دستور pending (در انتظار تأیید)
+    if "pending_command" in user_data:
+        await update.message.reply_text("⚠️ شما یک دستور تأییدنشده دارید. لطفاً اول آن را تأیید یا لغو کنید.")
+        return
+
+    # مدیریت دستور cd
+    cd_match = re.match(r"^cd\s+(.+)$", text, re.IGNORECASE)
+    if cd_match:
+        new_dir = cd_match.group(1).strip()
+        # پاک‌سازی نسبی
+        if new_dir.startswith("~"):
+            new_dir = os.path.expanduser(new_dir)
+        user_data["current_dir"] = new_dir
+        await update.message.reply_text(f"📁 دایرکتوری جاری به «{new_dir}» تغییر یافت.")
+        return
+
+    # پیشوند دایرکتوری جاری
+    current_dir = user_data.get("current_dir", "~")
+    if current_dir:
+        full_command = f"cd '{current_dir}' && {text}"
+    else:
+        full_command = text
+
+    # بررسی دستورات خطرناک – نیاز به تأیید
+    dangerous_patterns = [
+        r"\brm\b", r"\bdd\b", r"\bmkfs\b", r"\bformat\b",
+        r":\(\)\s*\{\s*:\s*\|:.*",  # fork bomb
+        r">\s*/dev/sd[a-z]",
+    ]
+    is_dangerous = any(re.search(pat, text, re.IGNORECASE) for pat in dangerous_patterns)
+    if is_dangerous:
+        user_data["pending_command"] = full_command
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ بله، اجرا کن", callback_data="confirmcmd_yes"),
+                InlineKeyboardButton("❌ لغو", callback_data="confirmcmd_no")
+            ]
+        ]
+        await update.message.reply_text(
+            f"⚠️ دستور زیر خطرناک به نظر می‌رسد:\n`{text}`\nآیا از اجرای آن مطمئن هستید؟",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # اجرای مستقیم
     await update.message.reply_text("⏳ در حال اجرای دستور...")
-    output = await execute_command(active_id, user_id, text)
-    await send_long_message(update, output)
+    await execute_command_streaming(active_id, user_id, full_command, update, context)
 
 # ---------- کلیک روی دکمه‌های شیشه‌ای ----------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,6 +563,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user_data = context.user_data
 
+    # تأیید / لغو دستور خطرناک
+    if data == "confirmcmd_yes":
+        command = user_data.pop("pending_command", None)
+        if not command:
+            await query.edit_message_text("❌ دستوری برای اجرا یافت نشد.")
+            return
+        await query.edit_message_text("⏳ در حال اجرای دستور تأییدشده...")
+        active_id = user_data.get("active_server_id")
+        if not active_id:
+            await query.edit_message_text("❌ سرور فعالی وجود ندارد.")
+            return
+        await execute_command_streaming(active_id, user_id, command, query, context)
+        return
+
+    elif data == "confirmcmd_no":
+        user_data.pop("pending_command", None)
+        await query.edit_message_text("❌ اجرای دستور لغو شد.")
+        return
+
+    # جابه‌جایی بین سرورها
     if data.startswith("switch_"):
         server_id = int(data.split("_")[1])
         server = await get_server_by_id(server_id)
@@ -501,6 +596,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if old_active:
                 await logout_server(old_active)
             user_data["active_server_id"] = server_id
+            user_data["current_dir"] = "~"   # ریست دایرکتوری
             await query.edit_message_text(f"✅ به {server['name']} متصل شدید.\nاکنون می‌توانید دستور بفرستید.")
             await context.bot.send_message(
                 chat_id=user_id,
@@ -510,6 +606,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await query.edit_message_text(f"❌ اتصال ناموفق: {e}")
 
+    # خروج از سرور
     elif data.startswith("logout_"):
         server_id = int(data.split("_")[1])
         server = await get_server_by_id(server_id)
@@ -532,6 +629,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await logout_server(server_id)
         if user_data.get("active_server_id") == server_id:
             user_data.pop("active_server_id", None)
+            user_data.pop("current_dir", None)
         await query.edit_message_text("✅ از سرور خارج شدید.")
         await context.bot.send_message(
             chat_id=user_id,
@@ -542,10 +640,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cancellogout":
         await query.edit_message_text("❌ عملیات لغو شد.")
 
-    # ---------- پنل مدیریت ----------
+    # ---------- پنل مدیریت (همانند قبل) ----------
     elif data == "admin_all_servers":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         rows = await get_all_servers_admin()
         if not rows:
             await query.edit_message_text("ℹ️ هیچ سروری وجود ندارد.")
@@ -556,8 +653,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text[:4096])
 
     elif data == "admin_list_users":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         users = await get_all_users()
         if not users:
             await query.edit_message_text("ℹ️ هیچ کاربری ثبت نشده.")
@@ -568,26 +664,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text[:4096])
 
     elif data == "admin_add_admin":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         context.user_data["admin_action"] = "add_admin"
         await query.edit_message_text("🆔 آیدی عددی ادمین جدید را وارد کنید:")
 
     elif data == "admin_remove_admin":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         context.user_data["admin_action"] = "remove_admin"
         await query.edit_message_text("🆔 آیدی عددی ادمینی که می‌خواهید حذف کنید را وارد کنید:")
 
     elif data == "admin_broadcast":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         context.user_data["admin_action"] = "broadcast"
         await query.edit_message_text("📢 پیام خود را برای ارسال به همه کاربران وارد کنید:")
 
     elif data == "admin_delete_server":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         rows = await get_all_servers_admin()
         if not rows:
             await query.edit_message_text("ℹ️ سروری برای حذف وجود ندارد.")
@@ -597,16 +689,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("admdel_"):
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         server_id = int(data.split("_")[1])
         await logout_server(server_id)
         await delete_server_from_db(server_id)
         await query.edit_message_text(f"✅ سرور {server_id} حذف شد.")
 
     elif data == "admin_stats":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT COUNT(*) FROM servers") as cur:
                 server_count = (await cur.fetchone())[0]
@@ -618,8 +708,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text)
 
     elif data == "admin_settings":
-        if not await is_admin(user_id):
-            return
+        if not await is_admin(user_id): return
         settings = await get_settings()
         text = "⚙️ تنظیمات فعلی:\n\n"
         text += f"max_concurrent_ssh: {settings.get('max_concurrent_ssh', MAX_CONCURRENT_SSH)}\n"
@@ -645,7 +734,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("🛡 پنل مدیریت:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ---------- مدیریت ورودی‌های ادمین ----------
+# ---------- ورودی‌های ادمین ----------
 async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_admin(user_id):
@@ -661,7 +750,6 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ آیدی عددی معتبر نیست.")
         finally:
             context.user_data.pop("admin_action", None)
-
     elif action == "remove_admin":
         try:
             target = int(text)
@@ -671,7 +759,6 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ آیدی عددی معتبر نیست.")
         finally:
             context.user_data.pop("admin_action", None)
-
     elif action == "broadcast":
         users = await get_all_users()
         success = 0
@@ -684,7 +771,7 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"✅ پیام به {success} از {len(users)} کاربر ارسال شد.")
         context.user_data.pop("admin_action", None)
 
-# ---------- تنظیم دستی تنظیمات (برای ادمین) ----------
+# ---------- /setsetting ----------
 async def set_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
         return
@@ -702,7 +789,7 @@ async def set_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- post_init ----------
 async def post_init(app: Application):
     global ssh_semaphore
-    await init_db()                     # راه‌اندازی دیتابیس
+    await init_db()
     settings = await get_settings()
     max_ssh = int(settings.get("max_concurrent_ssh", MAX_CONCURRENT_SSH))
     ssh_semaphore = asyncio.Semaphore(max_ssh)
